@@ -16,18 +16,18 @@
 
 'use strict';
 
-var DEFAULT_URL = 'compressed.tracemonkey-pldi-09.pdf';
-
 if (typeof PDFJSDev !== 'undefined' && PDFJSDev.test('CHROME')) {
+  var defaultUrl; // eslint-disable-line no-var
+
   (function rewriteUrlClosure() {
     // Run this code outside DOMContentLoaded to make sure that the URL
     // is rewritten as soon as possible.
-    var queryString = document.location.search.slice(1);
-    var m = /(^|&)file=([^&]*)/.exec(queryString);
-    DEFAULT_URL = m ? decodeURIComponent(m[2]) : '';
+    let queryString = document.location.search.slice(1);
+    let m = /(^|&)file=([^&]*)/.exec(queryString);
+    defaultUrl = m ? decodeURIComponent(m[2]) : '';
 
     // Example: chrome-extension://.../http://example.com/file.pdf
-    var humanReadableUrl = '/' + DEFAULT_URL + location.hash;
+    let humanReadableUrl = '/' + defaultUrl + location.hash;
     history.replaceState(history.state, '', humanReadableUrl);
     if (top === window) {
       chrome.runtime.sendMessage('showPageAction');
@@ -35,15 +35,18 @@ if (typeof PDFJSDev !== 'undefined' && PDFJSDev.test('CHROME')) {
   })();
 }
 
-var pdfjsWebApp;
+let pdfjsWebApp, pdfjsWebAppOptions;
 if (typeof PDFJSDev !== 'undefined' && PDFJSDev.test('PRODUCTION')) {
   pdfjsWebApp = require('./app.js');
+  pdfjsWebAppOptions = require('./app_options.js');
 }
 
 if (typeof PDFJSDev !== 'undefined' && PDFJSDev.test('FIREFOX || MOZCENTRAL')) {
-  // FIXME the l10n.js file in the Firefox extension needs global FirefoxCom.
-  window.FirefoxCom = require('./firefoxcom.js').FirefoxCom;
+  require('./firefoxcom.js');
   require('./firefox_print_service.js');
+}
+if (typeof PDFJSDev !== 'undefined' && PDFJSDev.test('GENERIC')) {
+  require('./genericcom.js');
 }
 if (typeof PDFJSDev !== 'undefined' && PDFJSDev.test('CHROME')) {
   require('./chromecom.js');
@@ -91,7 +94,8 @@ function getViewerConfiguration() {
       lastPageButton: document.getElementById('lastPage'),
       pageRotateCwButton: document.getElementById('pageRotateCw'),
       pageRotateCcwButton: document.getElementById('pageRotateCcw'),
-      toggleHandToolButton: document.getElementById('toggleHandTool'),
+      cursorSelectToolButton: document.getElementById('cursorSelectTool'),
+      cursorHandToolButton: document.getElementById('cursorHandTool'),
       documentPropertiesButton: document.getElementById('documentProperties'),
     },
     fullscreen: {
@@ -102,8 +106,8 @@ function getViewerConfiguration() {
     },
     sidebar: {
       // Divs (and sidebar button)
-      mainContainer: document.getElementById('mainContainer'),
       outerContainer: document.getElementById('outerContainer'),
+      viewerContainer: document.getElementById('viewerContainer'),
       toggleButton: document.getElementById('sidebarToggle'),
       // Buttons
       thumbnailButton: document.getElementById('viewThumbnail'),
@@ -113,6 +117,10 @@ function getViewerConfiguration() {
       thumbnailView: document.getElementById('thumbnailView'),
       outlineView: document.getElementById('outlineView'),
       attachmentsView: document.getElementById('attachmentsView'),
+    },
+    sidebarResizer: {
+      outerContainer: document.getElementById('outerContainer'),
+      resizer: document.getElementById('sidebarResizer'),
     },
     findBar: {
       bar: document.getElementById('findbar'),
@@ -124,7 +132,7 @@ function getViewerConfiguration() {
       findResultsCount: document.getElementById('findResultsCount'),
       findStatusIcon: document.getElementById('findStatusIcon'),
       findPreviousButton: document.getElementById('findPrevious'),
-      findNextButton: document.getElementById('findNext')
+      findNextButton: document.getElementById('findNext'),
     },
     passwordOverlay: {
       overlayName: 'passwordOverlay',
@@ -132,7 +140,7 @@ function getViewerConfiguration() {
       label: document.getElementById('passwordText'),
       input: document.getElementById('password'),
       submitButton: document.getElementById('passwordSubmit'),
-      cancelButton: document.getElementById('passwordCancel')
+      cancelButton: document.getElementById('passwordCancel'),
     },
     documentProperties: {
       overlayName: 'documentPropertiesOverlay',
@@ -150,8 +158,9 @@ function getViewerConfiguration() {
         'creator': document.getElementById('creatorField'),
         'producer': document.getElementById('producerField'),
         'version': document.getElementById('versionField'),
-        'pageCount': document.getElementById('pageCountField')
-      }
+        'pageCount': document.getElementById('pageCountField'),
+        'pageSize': document.getElementById('pageSizeField'),
+      },
     },
     errorWrapper: {
       container: document.getElementById('errorWrapper'),
@@ -164,22 +173,29 @@ function getViewerConfiguration() {
     printContainer: document.getElementById('printContainer'),
     openFileInputName: 'fileInput',
     debuggerScriptPath: './debugger.js',
-    defaultUrl: DEFAULT_URL
   };
 }
 
 function webViewerLoad() {
-  var config = getViewerConfiguration();
+  let config = getViewerConfiguration();
   if (typeof PDFJSDev === 'undefined' || !PDFJSDev.test('PRODUCTION')) {
-    Promise.all([SystemJS.import('pdfjs-web/app'),
-                 SystemJS.import('pdfjs-web/pdf_print_service')])
-           .then(function (modules) {
-      var app = modules[0];
+    Promise.all([
+      SystemJS.import('pdfjs-web/app'),
+      SystemJS.import('pdfjs-web/app_options'),
+      SystemJS.import('pdfjs-web/genericcom'),
+      SystemJS.import('pdfjs-web/pdf_print_service'),
+    ]).then(function([app, appOptions, ...otherModules]) {
       window.PDFViewerApplication = app.PDFViewerApplication;
+      window.PDFViewerApplicationOptions = appOptions.AppOptions;
       app.PDFViewerApplication.run(config);
     });
   } else {
+    if (typeof PDFJSDev !== 'undefined' && PDFJSDev.test('CHROME')) {
+      pdfjsWebAppOptions.AppOptions.set('defaultUrl', defaultUrl);
+    }
+
     window.PDFViewerApplication = pdfjsWebApp.PDFViewerApplication;
+    window.PDFViewerApplicationOptions = pdfjsWebAppOptions.AppOptions;
     pdfjsWebApp.PDFViewerApplication.run(config);
   }
 }

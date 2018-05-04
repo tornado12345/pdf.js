@@ -21,7 +21,8 @@
  */
 /*
   Additional modifications for PDF.js project:
-    - Disables language initialization on page loading;
+    - Disables language initialization on page loading.
+    - Disables document translation on page loading.
     - Removes consoleWarn and consoleLog and use console.log/warn directly.
     - Removes window._ assignment.
     - Remove compatibility code for OldIE.
@@ -144,10 +145,10 @@ document.webL10n = (function(window, document, undefined) {
    *    locale (language) to parse. Must be a lowercase string.
    *
    * @param {Function} successCallback
-   *    triggered when the l10n resource has been successully parsed.
+   *    triggered when the l10n resource has been successfully parsed.
    *
    * @param {Function} failureCallback
-   *    triggered when the an error has occured.
+   *    triggered when the an error has occurred.
    *
    * @return {void}
    *    uses the following global variables: gL10nData, gTextData, gTextProp.
@@ -998,7 +999,6 @@ document.webL10n = (function(window, document, undefined) {
       loadLocale(lang, function() {
         if (callback)
           callback();
-        translateFragment();
       });
     },
 
