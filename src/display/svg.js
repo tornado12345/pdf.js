@@ -16,9 +16,9 @@
 
 import {
   createObjectURL, FONT_IDENTITY_MATRIX, IDENTITY_MATRIX, ImageKind, isNum, OPS,
-  Util, warn
+  TextRenderingMode, Util, warn
 } from '../shared/util';
-import { DOMSVGFactory } from './dom_utils';
+import { DOMSVGFactory } from './display_utils';
 import isNodeJS from '../shared/is_node';
 
 var SVGGraphics = function() {
@@ -281,6 +281,8 @@ var SVGExtraState = (function SVGExtraStateClosure() {
     this.textMatrix = IDENTITY_MATRIX;
     this.fontMatrix = FONT_IDENTITY_MATRIX;
     this.leading = 0;
+    this.textRenderingMode = TextRenderingMode.FILL;
+    this.textMatrixScale = 1;
 
     // Current point (in user coordinates)
     this.x = 0;
@@ -372,7 +374,7 @@ SVGGraphics = (function SVGGraphicsClosure() {
     do {
       i--;
     } while (s[i] === '0');
-    return s.substr(0, s[i] === '.' ? i : i + 1);
+    return s.substring(0, s[i] === '.' ? i : i + 1);
   }
 
   /**
@@ -570,6 +572,9 @@ SVGGraphics = (function SVGGraphicsClosure() {
           case OPS.setTextRise:
             this.setTextRise(args[0]);
             break;
+          case OPS.setTextRenderingMode:
+            this.setTextRenderingMode(args[0]);
+            break;
           case OPS.setLineWidth:
             this.setLineWidth(args[0]);
             break;
@@ -686,6 +691,7 @@ SVGGraphics = (function SVGGraphicsClosure() {
     setTextMatrix: function SVGGraphics_setTextMatrix(a, b, c, d, e, f) {
       var current = this.current;
       this.current.textMatrix = this.current.lineMatrix = [a, b, c, d, e, f];
+      current.textMatrixScale = Math.sqrt(a * a + b * b);
 
       this.current.x = this.current.lineX = 0;
       this.current.y = this.current.lineY = 0;
@@ -706,6 +712,7 @@ SVGGraphics = (function SVGGraphicsClosure() {
       this.current.y = this.current.lineY = 0;
       this.current.textMatrix = IDENTITY_MATRIX;
       this.current.lineMatrix = IDENTITY_MATRIX;
+      this.current.textMatrixScale = 1;
       this.current.tspan = this.svgFactory.createElement('svg:tspan');
       this.current.txtElement = this.svgFactory.createElement('svg:text');
       this.current.txtgrp = this.svgFactory.createElement('svg:g');
@@ -789,8 +796,30 @@ SVGGraphics = (function SVGGraphicsClosure() {
       if (current.fontWeight !== SVG_DEFAULTS.fontWeight) {
         current.tspan.setAttributeNS(null, 'font-weight', current.fontWeight);
       }
-      if (current.fillColor !== SVG_DEFAULTS.fillColor) {
-        current.tspan.setAttributeNS(null, 'fill', current.fillColor);
+
+      const fillStrokeMode = current.textRenderingMode &
+        TextRenderingMode.FILL_STROKE_MASK;
+
+      if (fillStrokeMode === TextRenderingMode.FILL ||
+          fillStrokeMode === TextRenderingMode.FILL_STROKE) {
+        if (current.fillColor !== SVG_DEFAULTS.fillColor) {
+          current.tspan.setAttributeNS(null, 'fill', current.fillColor);
+        }
+        if (current.fillAlpha < 1) {
+          current.tspan.setAttributeNS(null, 'fill-opacity', current.fillAlpha);
+        }
+      } else if (current.textRenderingMode === TextRenderingMode.ADD_TO_PATH) {
+        // Workaround for Firefox: We must set fill="transparent" because
+        // fill="none" would generate an empty clipping path.
+        current.tspan.setAttributeNS(null, 'fill', 'transparent');
+      } else {
+        current.tspan.setAttributeNS(null, 'fill', 'none');
+      }
+
+      if (fillStrokeMode === TextRenderingMode.STROKE ||
+          fillStrokeMode === TextRenderingMode.FILL_STROKE) {
+        const lineWidthScale = 1 / (current.textMatrixScale || 1);
+        this._setStrokeAttributes(current.tspan, lineWidthScale);
       }
 
       // Include the text rise in the text matrix since the `pm` function
@@ -865,11 +894,22 @@ SVGGraphics = (function SVGGraphicsClosure() {
       current.xcoords = [];
     },
 
-    endText: function SVGGraphics_endText() {},
+    endText() {
+      const current = this.current;
+      if ((current.textRenderingMode & TextRenderingMode.ADD_TO_PATH_FLAG) &&
+          current.txtElement && current.txtElement.hasChildNodes()) {
+        // If no glyphs are shown (i.e. no child nodes), no clipping occurs.
+        current.element = current.txtElement;
+        this.clip('nonzero');
+        this.endPath();
+      }
+    },
 
     // Path properties
     setLineWidth: function SVGGraphics_setLineWidth(width) {
-      this.current.lineWidth = width;
+      if (width > 0) {
+        this.current.lineWidth = width;
+      }
     },
     setLineCap: function SVGGraphics_setLineCap(style) {
       this.current.lineCap = LINE_CAP_STYLES[style];
@@ -904,7 +944,6 @@ SVGGraphics = (function SVGGraphicsClosure() {
     constructPath: function SVGGraphics_constructPath(ops, args) {
       var current = this.current;
       var x = current.x, y = current.y;
-      current.path = this.svgFactory.createElement('svg:path');
       var d = [];
       var opLength = ops.length;
 
@@ -956,10 +995,22 @@ SVGGraphics = (function SVGGraphicsClosure() {
             break;
         }
       }
-      current.path.setAttributeNS(null, 'd', d.join(' '));
-      current.path.setAttributeNS(null, 'fill', 'none');
 
-      this._ensureTransformGroup().appendChild(current.path);
+      d = d.join(' ');
+
+      if (current.path && opLength > 0 && ops[0] !== OPS.rectangle &&
+          ops[0] !== OPS.moveTo) {
+        // If a path does not start with an OPS.rectangle or OPS.moveTo, it has
+        // probably been divided into two OPS.constructPath operators by
+        // OperatorList. Append the commands to the previous path element.
+        d = current.path.getAttributeNS(null, 'd') + d;
+      } else {
+        current.path = this.svgFactory.createElement('svg:path');
+        this._ensureTransformGroup().appendChild(current.path);
+      }
+
+      current.path.setAttributeNS(null, 'd', d);
+      current.path.setAttributeNS(null, 'fill', 'none');
 
       // Saving a reference in current.element so that it can be addressed
       // in 'fill' and 'stroke'
@@ -968,6 +1019,9 @@ SVGGraphics = (function SVGGraphicsClosure() {
     },
 
     endPath: function SVGGraphics_endPath() {
+      // Painting operators end a path.
+      this.current.path = null;
+
       if (!this.pendingClip) {
         return;
       }
@@ -978,7 +1032,8 @@ SVGGraphics = (function SVGGraphicsClosure() {
       var clipPath = this.svgFactory.createElement('svg:clipPath');
       clipPath.setAttributeNS(null, 'id', clipId);
       clipPath.setAttributeNS(null, 'transform', pm(this.transformMatrix));
-      var clipElement = current.element.cloneNode();
+      // A deep clone is needed when text is used as a clipping path.
+      const clipElement = current.element.cloneNode(true);
       if (this.pendingClip === 'evenodd') {
         clipElement.setAttributeNS(null, 'clip-rule', 'evenodd');
       } else {
@@ -1022,6 +1077,10 @@ SVGGraphics = (function SVGGraphicsClosure() {
 
     setTextRise: function SVGGraphics_setTextRise(textRise) {
       this.current.textRise = textRise;
+    },
+
+    setTextRenderingMode(textRenderingMode) {
+      this.current.textRenderingMode = textRenderingMode;
     },
 
     setHScale: function SVGGraphics_setHScale(scale) {
@@ -1079,25 +1138,37 @@ SVGGraphics = (function SVGGraphicsClosure() {
       var current = this.current;
 
       if (current.element) {
-        current.element.setAttributeNS(null, 'stroke', current.strokeColor);
-        current.element.setAttributeNS(null, 'stroke-opacity',
-                                       current.strokeAlpha);
-        current.element.setAttributeNS(null, 'stroke-miterlimit',
-                                       pf(current.miterLimit));
-        current.element.setAttributeNS(null, 'stroke-linecap', current.lineCap);
-        current.element.setAttributeNS(null, 'stroke-linejoin',
-                                       current.lineJoin);
-        current.element.setAttributeNS(null, 'stroke-width',
-                                       pf(current.lineWidth) + 'px');
-        current.element.setAttributeNS(null, 'stroke-dasharray',
-                                       current.dashArray.map(pf).join(' '));
-        current.element.setAttributeNS(null, 'stroke-dashoffset',
-                                       pf(current.dashPhase) + 'px');
+        this._setStrokeAttributes(current.element);
 
         current.element.setAttributeNS(null, 'fill', 'none');
 
         this.endPath();
       }
+    },
+
+    /**
+     * @private
+     */
+    _setStrokeAttributes(element, lineWidthScale = 1) {
+      const current = this.current;
+      let dashArray = current.dashArray;
+      if (lineWidthScale !== 1 && dashArray.length > 0) {
+        dashArray = dashArray.map(function(value) {
+          return lineWidthScale * value;
+        });
+      }
+      element.setAttributeNS(null, 'stroke', current.strokeColor);
+      element.setAttributeNS(null, 'stroke-opacity', current.strokeAlpha);
+      element.setAttributeNS(null, 'stroke-miterlimit',
+                             pf(current.miterLimit));
+      element.setAttributeNS(null, 'stroke-linecap', current.lineCap);
+      element.setAttributeNS(null, 'stroke-linejoin', current.lineJoin);
+      element.setAttributeNS(null, 'stroke-width',
+                             pf(lineWidthScale * current.lineWidth) + 'px');
+      element.setAttributeNS(null, 'stroke-dasharray',
+                             dashArray.map(pf).join(' '));
+      element.setAttributeNS(null, 'stroke-dashoffset',
+                             pf(lineWidthScale * current.dashPhase) + 'px');
     },
 
     eoFill: function SVGGraphics_eoFill() {
@@ -1233,7 +1304,7 @@ SVGGraphics = (function SVGGraphicsClosure() {
                        matrix[3], matrix[4], matrix[5]);
       }
 
-      if (Array.isArray(bbox) && bbox.length === 4) {
+      if (bbox) {
         var width = bbox[2] - bbox[0];
         var height = bbox[3] - bbox[1];
 

@@ -12,27 +12,40 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+/* eslint no-var: error */
 
 import {
   AnnotationBorderStyleType, AnnotationFieldFlag, AnnotationFlag,
-  AnnotationType, getInheritableProperty, OPS, stringToBytes, stringToPDFString,
-  Util, warn
+  AnnotationType, OPS, stringToBytes, stringToPDFString, Util, warn
 } from '../shared/util';
 import { Catalog, FileSpec, ObjectLoader } from './obj';
 import { Dict, isDict, isName, isRef, isStream } from './primitives';
 import { ColorSpace } from './colorspace';
+import { getInheritableProperty } from './core_utils';
 import { OperatorList } from './operator_list';
 import { Stream } from './stream';
 
 class AnnotationFactory {
   /**
+   * Create an `Annotation` object of the correct type for the given reference
+   * to an annotation dictionary. This yields a promise that is resolved when
+   * the `Annotation` object is constructed.
+   *
    * @param {XRef} xref
    * @param {Object} ref
    * @param {PDFManager} pdfManager
    * @param {Object} idFactory
-   * @returns {Annotation}
+   * @return {Promise} A promise that is resolved with an {Annotation} instance.
    */
   static create(xref, ref, pdfManager, idFactory) {
+    return pdfManager.ensure(this, '_create',
+                             [xref, ref, pdfManager, idFactory]);
+  }
+
+  /**
+   * @private
+   */
+  static _create(xref, ref, pdfManager, idFactory) {
     let dict = xref.fetchIfRef(ref);
     if (!isDict(dict)) {
       return;
@@ -93,6 +106,9 @@ class AnnotationFactory {
 
       case 'Polygon':
         return new PolygonAnnotation(parameters);
+
+      case 'Ink':
+        return new InkAnnotation(parameters);
 
       case 'Highlight':
         return new HighlightAnnotation(parameters);
@@ -261,6 +277,7 @@ class Annotation {
 
   /**
    * Set the color and take care of color space conversion.
+   * The default value is black, in RGB color space.
    *
    * @public
    * @memberof Annotation
@@ -269,7 +286,7 @@ class Annotation {
    *                        4 (CMYK) elements
    */
   setColor(color) {
-    let rgbColor = new Uint8Array(3); // Black in RGB color space (default)
+    let rgbColor = new Uint8ClampedArray(3);
     if (!Array.isArray(color)) {
       this.color = rgbColor;
       return;
@@ -466,6 +483,12 @@ class AnnotationBorderStyle {
    * @param {integer} width - The width
    */
   setWidth(width) {
+    // Some corrupt PDF generators may provide the width as a `Name`,
+    // rather than as a number (fixes issue 10385).
+    if (isName(width)) {
+      this.width = 0; // This is consistent with the behaviour in Adobe Reader.
+      return;
+    }
     if (Number.isInteger(width)) {
       this.width = width;
     }
@@ -476,11 +499,11 @@ class AnnotationBorderStyle {
    *
    * @public
    * @memberof AnnotationBorderStyle
-   * @param {Object} style - The style object
+   * @param {Name} style - The annotation style.
    * @see {@link shared/util.js}
    */
   setStyle(style) {
-    if (!style) {
+    if (!isName(style)) {
       return;
     }
     switch (style.name) {
@@ -597,8 +620,11 @@ class WidgetAnnotation extends Annotation {
 
     data.readOnly = this.hasFieldFlag(AnnotationFieldFlag.READONLY);
 
-    // Hide signatures because we cannot validate them.
+    // Hide signatures because we cannot validate them, and unset the fieldValue
+    // since it's (most likely) a `Dict` which is non-serializable and will thus
+    // cause errors when sending annotations to the main-thread (issue 10347).
     if (data.fieldType === 'Sig') {
+      data.fieldValue = null;
       this.setFlags(AnnotationFlag.HIDDEN);
     }
   }
@@ -741,7 +767,7 @@ class ButtonWidgetAnnotation extends WidgetAnnotation {
     this.data.pushButton = this.hasFieldFlag(AnnotationFieldFlag.PUSHBUTTON);
 
     if (this.data.checkBox) {
-      this._processCheckBox();
+      this._processCheckBox(params);
     } else if (this.data.radioButton) {
       this._processRadioButton(params);
     } else if (this.data.pushButton) {
@@ -751,11 +777,29 @@ class ButtonWidgetAnnotation extends WidgetAnnotation {
     }
   }
 
-  _processCheckBox() {
-    if (!isName(this.data.fieldValue)) {
+  _processCheckBox(params) {
+    if (isName(this.data.fieldValue)) {
+      this.data.fieldValue = this.data.fieldValue.name;
+    }
+
+    const customAppearance = params.dict.get('AP');
+    if (!isDict(customAppearance)) {
       return;
     }
-    this.data.fieldValue = this.data.fieldValue.name;
+
+    const exportValueOptionsDict = customAppearance.get('D');
+    if (!isDict(exportValueOptionsDict)) {
+      return;
+    }
+
+    const exportValues = exportValueOptionsDict.getKeys();
+    const hasCorrectOptionCount = exportValues.length === 2;
+    if (!hasCorrectOptionCount) {
+      return;
+    }
+
+    this.data.exportValue = exportValues[0] === 'Off' ?
+      exportValues[1] : exportValues[0];
   }
 
   _processRadioButton(params) {
@@ -979,6 +1023,34 @@ class PolygonAnnotation extends PolylineAnnotation {
     super(parameters);
 
     this.data.annotationType = AnnotationType.POLYGON;
+  }
+}
+
+class InkAnnotation extends Annotation {
+  constructor(parameters) {
+    super(parameters);
+
+    this.data.annotationType = AnnotationType.INK;
+
+    let dict = parameters.dict;
+    const xref = parameters.xref;
+
+    let originalInkLists = dict.getArray('InkList');
+    this.data.inkLists = [];
+    for (let i = 0, ii = originalInkLists.length; i < ii; ++i) {
+      // The raw ink lists array contains arrays of numbers representing
+      // the alternating horizontal and vertical coordinates, respectively,
+      // of each vertex. Convert this to an array of objects with x and y
+      // coordinates.
+      this.data.inkLists.push([]);
+      for (let j = 0, jj = originalInkLists[i].length; j < jj; j += 2) {
+        this.data.inkLists[i].push({
+          x: xref.fetchIfRef(originalInkLists[i][j]),
+          y: xref.fetchIfRef(originalInkLists[i][j + 1]),
+        });
+      }
+    }
+    this._preparePopup(dict);
   }
 }
 
